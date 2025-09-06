@@ -19,12 +19,12 @@
 
 ```powershell
 # 進入後端
-cd "c:\Users\luo\Desktop\學習工具\server"
+cd "c:\Users\[使用者名稱]\Desktop\學習工具\server"
 npm i
 npm run dev
 
 # 開新視窗後進入前端
-cd "c:\Users\luo\Desktop\學習工具\client"
+cd "c:\Users\[使用者名稱]\Desktop\學習工具\client"
 npm i
 npm run dev
 ```
