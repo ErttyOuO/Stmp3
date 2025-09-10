@@ -40,6 +40,22 @@ model = WhisperModel(model_name, **kwargs)
 
 segments, info = model.transcribe(in_audio, language="zh", task="transcribe")
 
+duration = getattr(info, 'duration', None) or 0.0
+last_progress = -1
+
 with open(out_txt, 'w', encoding='utf-8') as f:
     for segment in segments:
-        f.write(segment.text.strip() + "\n")
+        text = (segment.text or '').strip()
+        if text:
+            f.write(text + "\n")
+        # 計算進度：使用片段結束時間 / 總長度
+        if duration and getattr(segment, 'end', None) is not None:
+            pct = int(min(100, max(0, (segment.end / duration) * 100)))
+            # 僅在整數進度前進時輸出，減少雜訊
+            if pct != last_progress:
+                print(f"PROGRESS {pct}", flush=True)
+                last_progress = pct
+
+# 確保最終輸出 100
+if last_progress < 100:
+    print("PROGRESS 100", flush=True)

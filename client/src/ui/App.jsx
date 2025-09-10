@@ -16,6 +16,8 @@ export default function App() {
   const [googleKey, setGoogleKey] = useState('')
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState('')
+  const [progress, setProgress] = useState(null) // null | number
+  const [jobId, setJobId] = useState(null)
 
   const saveKey = async (provider, apiKey) => {
     if (!apiKey) return
@@ -23,17 +25,50 @@ export default function App() {
     alert(`${provider} 金鑰已保存`)
   }
 
+  const pollJob = async (id) => {
+    try {
+      const { data } = await axios.get(`/api/transcribe/${id}`)
+      if (typeof data.progress === 'number') setProgress(data.progress)
+      if (data.status === 'done') {
+        setTranscribed(data.result)
+        setLoading(false)
+        setJobId(null)
+        return
+      }
+      if (data.status === 'error') {
+        alert(data.error || '轉錄失敗')
+        setLoading(false)
+        setJobId(null)
+        return
+      }
+      // 繼續輪詢
+      setTimeout(() => pollJob(id), 1500)
+    } catch (e) {
+      console.error(e)
+      setLoading(false)
+      setJobId(null)
+    }
+  }
+
   const handleUpload = async () => {
     if (!audio) return alert('請先選擇 mp3 / wav 檔案')
     const form = new FormData()
     form.append('audio', audio)
     setLoading(true)
+    setProgress(null)
+    setJobId(null)
     try {
-  const { data } = await axios.post('/api/transcribe', form)
-      setTranscribed(data.text)
+      const { data } = await axios.post('/api/transcribe', form)
+      if (data.done) {
+        setTranscribed(data.text)
+        setLoading(false)
+      } else if (data.jobId) {
+        setJobId(data.jobId)
+        setProgress(0)
+        pollJob(data.jobId)
+      }
     } catch (e) {
       alert(e?.response?.data?.error || e.message)
-    } finally {
       setLoading(false)
     }
   }
@@ -72,7 +107,15 @@ export default function App() {
       <Section title="1) 上傳音檔（mp3 / wav）">
         <input type="file" accept="audio/mpeg,audio/wav" onChange={e => setAudio(e.target.files?.[0] || null)} />
         <button onClick={handleUpload} disabled={loading} style={{ marginLeft: 8 }}>開始轉文字</button>
-        {loading && <span style={{ marginLeft: 8 }}>處理中…</span>}
+        {loading && progress === null && <span style={{ marginLeft: 8 }}>處理中…</span>}
+        {loading && progress !== null && (
+          <span style={{ marginLeft: 8 }}>
+            轉錄進度：{progress}%
+            <span style={{ display: 'inline-block', width: 120, height: 8, background: '#eee', marginLeft: 8, verticalAlign: 'middle' }}>
+              <span style={{ display: 'block', width: `${progress}%`, height: '100%', background: '#4caf50', transition: 'width 0.5s' }} />
+            </span>
+          </span>
+        )}
       </Section>
 
       <Section title="2) 金鑰管理">
