@@ -1,3 +1,12 @@
+"""桌面版 學習工具：回滾至穩定 CPU + 進度版本，加入安全 GPU fallback。
+
+功能：
+1. 本機 faster-whisper 轉錄（large-v3-turbo），自動嘗試 GPU -> CPU。
+2. 進度條：本機模式顯示百分比；雲端(openai)模式顯示旋轉不定進度。
+3. OpenAI / Google 生成講義，或匯出 transcript + 複製提示詞。
+4. API Key 本地加密儲存。
+"""
+
 import os
 import json
 import threading
@@ -5,30 +14,29 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from tkinter import ttk
 from pathlib import Path
-from base64 import urlsafe_b64encode, urlsafe_b64decode
+from base64 import urlsafe_b64encode
 from cryptography.fernet import Fernet
 import requests
 
-# 啟用 Windows 高 DPI 感知，避免縮放導致糊字（需在建立 Tk 之前呼叫）
+# ---------------- Windows DPI -----------------
 def _enable_windows_dpi_awareness():
     if os.name != 'nt':
         return
     try:
         import ctypes
         try:
-            # Per-Monitor DPI Aware（Windows 8.1+）
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
-            # System DPI Aware（較舊系統）
             ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
 
-# 可選：本機轉錄（large-v3-turbo）
-LOCAL_ENABLED = True
+# ---------------- Local Whisper Availability -----------------
 try:
-    from faster_whisper import WhisperModel
+    from faster_whisper import WhisperModel  # type: ignore
+    LOCAL_ENABLED = True
 except Exception:
+    WhisperModel = None  # type: ignore
     LOCAL_ENABLED = False
 
 APP_DIR = Path(__file__).parent
@@ -44,16 +52,14 @@ DEFAULT_PROMPT = (
     "4. 結語與思考題\n   - 撰寫簡短的收尾語，鼓勵學員持續學習。\n   - 提供 1-2 個思考題，讓學員反思並能與日常生活/工作連結。\n\n"
 )
 
-# -- 簡易本機加密 --
 SECRET = urlsafe_b64encode(os.environ.get('STUDY_TOOL_SECRET', 'local-dev-secret').encode().ljust(32, b'0'))
 fer = Fernet(SECRET)
 
-def enc(s: str):
+def enc(s: str) -> str:
     return fer.encrypt(s.encode()).decode()
 
-def dec(s: str):
+def dec(s: str) -> str:
     return fer.decrypt(s.encode()).decode()
-
 
 def load_config():
     if CONF_FILE.exists():
@@ -67,13 +73,49 @@ def load_config():
             return {}
     return {}
 
-
 def save_config(cfg: dict):
     out = cfg.copy()
     for k in ('openai','google'):
         if out.get(k):
             out[k] = enc(out[k])
     CONF_FILE.write_text(json.dumps(out), encoding='utf-8')
+
+# ------------- Lazy Model (GPU -> CPU fallback) -------------
+_LOCAL_MODEL = None
+_LOCAL_MODEL_LABEL = ''  # e.g. 'cuda/float16' or 'cpu/int8'
+_MODEL_LOCK = threading.Lock()
+
+def _load_local_model():  # returns model, label
+    global _LOCAL_MODEL, _LOCAL_MODEL_LABEL
+    if not LOCAL_ENABLED:
+        raise RuntimeError('本機模型不可用，請改用 OpenAI 模式')
+    if _LOCAL_MODEL is not None:
+        return _LOCAL_MODEL, _LOCAL_MODEL_LABEL
+    if WhisperModel is None:  # safety
+        raise RuntimeError('faster-whisper 未安裝')
+    attempts = [
+        ('cuda', 'float16'),
+        ('cuda', 'int8_float16'),
+        ('cuda', 'int8'),
+        ('cpu', 'int8'),
+        ('cpu', 'int8_float16'),
+        ('cpu', 'float32'),
+    ]
+    errors = []
+    with _MODEL_LOCK:
+        if _LOCAL_MODEL is not None:  # double-check after acquiring lock
+            return _LOCAL_MODEL, _LOCAL_MODEL_LABEL
+        for dev, ctype in attempts:
+            try:
+                m = WhisperModel('large-v3-turbo', device=dev, compute_type=ctype)
+                _LOCAL_MODEL = m
+                _LOCAL_MODEL_LABEL = f'{dev}/{ctype}'
+                break
+            except Exception as e:
+                errors.append(f'{dev}/{ctype}: {e}')
+        if _LOCAL_MODEL is None:
+            raise RuntimeError('本機模型載入失敗:\n' + '\n'.join(errors))
+    return _LOCAL_MODEL, _LOCAL_MODEL_LABEL
 
 
 class App(tk.Tk):
@@ -84,44 +126,38 @@ class App(tk.Tk):
         self.resizable(True, True)
 
         self.cfg = load_config()
-
         self.audio_path = tk.StringVar()
         self.mode = tk.StringVar(value='local' if LOCAL_ENABLED else 'openai')
         self.openai_key = tk.StringVar(value=self.cfg.get('openai',''))
         self.google_key = tk.StringVar(value=self.cfg.get('google',''))
-
         self.prompt = tk.StringVar(value=DEFAULT_PROMPT)
-
         self.is_busy = False
+        self._model_loaded = False
+        self._model_label = ''
 
         self._build_ui()
-        # 依實際螢幕 DPI 調整 Tk 的 scaling，讓字型與元件更銳利
         if os.name == 'nt':
             try:
-                dpi = self.winfo_fpixels('1i')  # 每英吋像素
+                dpi = self.winfo_fpixels('1i')
                 self.tk.call('tk', 'scaling', dpi/72.0)
             except Exception:
                 pass
 
+    # ---------------- UI -----------------
     def _build_ui(self):
-        # Theme & style
         style = ttk.Style()
         try:
             style.theme_use('vista')
         except Exception:
             style.theme_use('clam')
-        style.configure('TButton', font=('Segoe UI', 10))
-        style.configure('TLabel', font=('Segoe UI', 10))
         style.configure('Header.TLabel', font=('Segoe UI', 13, 'bold'))
         style.configure('Card.TLabelframe', padding=10)
         style.configure('Card.TLabelframe.Label', font=('Segoe UI', 11, 'bold'))
 
         container = ttk.Frame(self)
         container.pack(fill='both', expand=True, padx=14, pady=14)
-
         ttk.Label(container, text='學習工具：語音轉文字＋講義生成（桌面版）', style='Header.TLabel').pack(anchor='w', pady=(0,8))
 
-        # 檔案選擇
         f1 = ttk.Labelframe(container, text='1) 上傳音檔（mp3/wav）', style='Card.TLabelframe')
         f1.pack(fill='x', pady=5)
         self.ent_audio = ttk.Entry(f1, textvariable=self.audio_path, width=80)
@@ -129,7 +165,6 @@ class App(tk.Tk):
         self.btn_choose = ttk.Button(f1, text='選擇檔案', command=self.choose_file)
         self.btn_choose.pack(side='left', padx=5)
 
-        # 模式 & 金鑰
         f2 = ttk.Labelframe(container, text='2) 轉錄模式與金鑰', style='Card.TLabelframe')
         f2.pack(fill='x', pady=5)
         self.rb_local = ttk.Radiobutton(f2, text='本機 large-v3-turbo', variable=self.mode, value='local')
@@ -138,7 +173,6 @@ class App(tk.Tk):
         self.rb_local.pack(side='left', padx=8)
         self.rb_openai = ttk.Radiobutton(f2, text='OpenAI Whisper API', variable=self.mode, value='openai')
         self.rb_openai.pack(side='left', padx=8)
-
         ttk.Label(f2, text='OpenAI API Key:').pack(side='left', padx=5)
         self.ent_openai = ttk.Entry(f2, textvariable=self.openai_key, width=30, show='*')
         self.ent_openai.pack(side='left')
@@ -148,24 +182,20 @@ class App(tk.Tk):
         self.btn_save_keys = ttk.Button(f2, text='儲存金鑰', command=self.save_keys)
         self.btn_save_keys.pack(side='left', padx=8)
 
-        # 轉錄 & 分析
         f3 = ttk.Labelframe(container, text='3) 轉錄與分析', style='Card.TLabelframe')
         f3.pack(fill='both', expand=False, pady=5)
         self.btn_transcribe = ttk.Button(f3, text='開始轉文字', command=self.run_transcribe)
         self.btn_transcribe.pack(side='left', padx=6, pady=6)
         self.status = ttk.Label(f3, text='就緒')
         self.status.pack(side='left', padx=10)
-        # 進度列：預設 indeterminate，若本機轉錄時改成 determinate 顯示百分比
         self.progress = ttk.Progressbar(f3, mode='indeterminate', length=180)
         self.progress.pack(side='left', padx=10)
 
-        # 轉錄文字
         f4 = ttk.Labelframe(container, text='4) 轉換文字（txt）', style='Card.TLabelframe')
         f4.pack(fill='both', expand=True, pady=5)
         self.txt_input = scrolledtext.ScrolledText(f4, height=10)
         self.txt_input.pack(fill='both', expand=True)
 
-        # 分析方式
         f5 = ttk.Labelframe(container, text='5) 分析方式', style='Card.TLabelframe')
         f5.pack(fill='x', pady=5)
         self.provider = tk.StringVar(value='openai')
@@ -178,16 +208,15 @@ class App(tk.Tk):
         self.btn_analyze = ttk.Button(f5, text='開始分析 / 匯出', command=self.run_analyze)
         self.btn_analyze.pack(side='left', padx=6)
 
-        # 結果
         f6 = ttk.Labelframe(container, text='6) 結果輸出', style='Card.TLabelframe')
         f6.pack(fill='both', expand=True, pady=5)
         self.txt_out = scrolledtext.ScrolledText(f6, height=14)
         self.txt_out.pack(fill='both', expand=True)
 
-        # 狀態列
         self.statusbar = ttk.Label(self, text='Ready', anchor='w')
         self.statusbar.pack(fill='x', side='bottom')
 
+    # ---------------- Events -----------------
     def choose_file(self):
         p = filedialog.askopenfilename(filetypes=[('Audio','*.mp3 *.wav')])
         if p:
@@ -204,7 +233,7 @@ class App(tk.Tk):
         if not path:
             messagebox.showwarning('提醒','請先選擇音檔')
             return
-        self._set_busy(True, '正在生成字幕中…')
+        self._set_busy(True, '正在初始化模型…' if (self.mode.get()=='local' and not self._model_loaded) else '正在生成字幕中…')
         threading.Thread(target=self._do_transcribe, args=(path,), daemon=True).start()
 
     def _do_transcribe(self, path):
@@ -215,14 +244,27 @@ class App(tk.Tk):
                 text = self._openai_transcribe(path)
             self.txt_input.delete('1.0', 'end')
             self.txt_input.insert('end', text)
-            self._set_busy(False, '字幕生成完成')
+            suffix = f' (本機 {self._model_label})' if (self.mode.get()=='local' and self._model_loaded) else ''
+            self._set_busy(False, f'字幕生成完成{suffix}')
         except Exception as e:
             self._set_busy(False, '字幕生成失敗')
             messagebox.showerror('錯誤', str(e))
 
+    # ---------------- Transcription -----------------
     def _local_transcribe(self, path):
-        """本機轉錄（含進度）。"""
-        model = WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')
+        if not self._model_loaded:
+            # 先顯示初始化狀態
+            self._update_status_inline('正在載入本機模型 (GPU→CPU fallback)…')
+            model, label = _load_local_model()
+            self._model_loaded = True
+            self._model_label = label
+            self._update_status_inline(f'模型已載入：{label}，開始轉錄…')
+        else:
+            model, label = _LOCAL_MODEL, self._model_label
+            self._update_status_inline(f'使用已載入模型：{label}，開始轉錄…')
+
+        # 調整進度條為 determinate
+        self._force_progress_mode_determinate()
         segments, info = model.transcribe(path, language='zh', task='transcribe')
         duration = getattr(info, 'duration', 0) or 0
         lines = []
@@ -238,7 +280,7 @@ class App(tk.Tk):
                     self._update_progress(pct)
         if last_pct < 100:
             self._update_progress(100)
-        return "\n".join(lines)
+        return '\n'.join(lines)
 
     def _openai_transcribe(self, path):
         key = self.openai_key.get().strip()
@@ -260,6 +302,7 @@ class App(tk.Tk):
                 raise RuntimeError(f'OpenAI 轉錄失敗: {r.status_code} {r.text}')
             return r.text.strip()
 
+    # ---------------- Analyze / Export -----------------
     def run_analyze(self):
         txt = self.txt_input.get('1.0', 'end').strip()
         if not txt:
@@ -269,7 +312,6 @@ class App(tk.Tk):
         if prov == 'export':
             self.clipboard_clear()
             self.clipboard_append(self.prompt.get())
-            # 匯出 txt
             p = filedialog.asksaveasfilename(defaultextension='.txt', initialfile='transcript.txt')
             if p:
                 Path(p).write_text(txt, encoding='utf-8')
@@ -293,31 +335,34 @@ class App(tk.Tk):
             self._set_busy(False, '筆記失敗')
             messagebox.showerror('錯誤', str(e))
 
+    # ---------------- Busy / Progress -----------------
+    def _force_progress_mode_determinate(self):
+        try:
+            if str(self.progress.cget('mode')) != 'determinate':
+                self.progress.config(mode='determinate', maximum=100, value=0)
+            else:
+                self.progress.config(value=0)
+        except Exception:
+            pass
+
     def _set_busy(self, busy: bool, msg: str = ''):
         self.is_busy = busy
-        # Progress 行為：本機模式 -> determinate 百分比； 其他 -> indeterminate
         try:
             if busy:
                 if self.mode.get() == 'local' and LOCAL_ENABLED:
-                    if str(self.progress.cget('mode')) != 'determinate':
-                        self.progress.config(mode='determinate', maximum=100, value=0)
-                    else:
-                        self.progress.config(value=0)
+                    self._force_progress_mode_determinate()
                 else:
-                    # API 模式未知進度
                     if str(self.progress.cget('mode')) != 'indeterminate':
                         self.progress.config(mode='indeterminate')
                     self.progress.start(12)
             else:
                 if str(self.progress.cget('mode')) == 'indeterminate':
                     self.progress.stop()
-                self.progress.config(value=0)
+                # 保留最後進度顯示，不強制清零
         except Exception:
             pass
-        # Status labels
         self.status.config(text=msg or ('處理中…' if busy else '就緒'))
         self.statusbar.config(text=msg or ('處理中…' if busy else 'Ready'))
-        # Enable/disable controls
         widgets = [
             self.btn_choose, self.btn_save_keys, self.btn_transcribe, self.btn_analyze,
             self.rb_local, self.rb_openai, self.rb_p_openai, self.rb_p_google, self.rb_p_export,
@@ -332,15 +377,22 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+    def _update_status_inline(self, msg: str):
+        def _do():
+            self.status.config(text=msg)
+            self.statusbar.config(text=msg)
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
+
     def _update_progress(self, pct: int):
-        """在主執行緒更新進度與狀態文字。"""
         def _do():
             if str(self.progress.cget('mode')) == 'determinate':
                 try:
                     self.progress.config(value=pct)
                 except Exception:
                     pass
-            # 只在 busy 狀態下顯示百分比
             if self.is_busy:
                 base = '正在生成字幕中…'
                 self.status.config(text=f"{base} {pct}%")
@@ -350,6 +402,7 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    # ---------------- AI Providers -----------------
     def _openai_analyze(self, prompt):
         key = self.openai_key.get().strip()
         if not key:
@@ -374,9 +427,7 @@ class App(tk.Tk):
         if not key:
             raise RuntimeError('缺少 Google API Key')
         url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}'
-        body = {
-            'contents': [{ 'role': 'user', 'parts': [{ 'text': prompt }] }]
-        }
+        body = { 'contents': [{ 'role': 'user', 'parts': [{ 'text': prompt }] }] }
         r = requests.post(url, json=body, timeout=120)
         if r.status_code >= 300:
             raise RuntimeError(f'Google 分析失敗: {r.status_code} {r.text}')
