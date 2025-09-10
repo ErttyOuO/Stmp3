@@ -155,6 +155,7 @@ class App(tk.Tk):
         self.btn_transcribe.pack(side='left', padx=6, pady=6)
         self.status = ttk.Label(f3, text='就緒')
         self.status.pack(side='left', padx=10)
+        # 進度列：預設 indeterminate，若本機轉錄時改成 determinate 顯示百分比
         self.progress = ttk.Progressbar(f3, mode='indeterminate', length=180)
         self.progress.pack(side='left', padx=10)
 
@@ -220,9 +221,23 @@ class App(tk.Tk):
             messagebox.showerror('錯誤', str(e))
 
     def _local_transcribe(self, path):
+        """本機轉錄（含進度）。"""
         model = WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')
-        segments, _ = model.transcribe(path, language='zh', task='transcribe')
-        lines = [seg.text.strip() for seg in segments]
+        segments, info = model.transcribe(path, language='zh', task='transcribe')
+        duration = getattr(info, 'duration', 0) or 0
+        lines = []
+        last_pct = -1
+        for seg in segments:
+            txt = (seg.text or '').strip()
+            if txt:
+                lines.append(txt)
+            if duration and getattr(seg, 'end', None) is not None:
+                pct = int(min(100, max(0, (seg.end / duration) * 100)))
+                if pct != last_pct:
+                    last_pct = pct
+                    self._update_progress(pct)
+        if last_pct < 100:
+            self._update_progress(100)
         return "\n".join(lines)
 
     def _openai_transcribe(self, path):
@@ -280,17 +295,25 @@ class App(tk.Tk):
 
     def _set_busy(self, busy: bool, msg: str = ''):
         self.is_busy = busy
-        # Progress
-        if busy:
-            try:
-                self.progress.start(12)
-            except Exception:
-                pass
-        else:
-            try:
-                self.progress.stop()
-            except Exception:
-                pass
+        # Progress 行為：本機模式 -> determinate 百分比； 其他 -> indeterminate
+        try:
+            if busy:
+                if self.mode.get() == 'local' and LOCAL_ENABLED:
+                    if str(self.progress.cget('mode')) != 'determinate':
+                        self.progress.config(mode='determinate', maximum=100, value=0)
+                    else:
+                        self.progress.config(value=0)
+                else:
+                    # API 模式未知進度
+                    if str(self.progress.cget('mode')) != 'indeterminate':
+                        self.progress.config(mode='indeterminate')
+                    self.progress.start(12)
+            else:
+                if str(self.progress.cget('mode')) == 'indeterminate':
+                    self.progress.stop()
+                self.progress.config(value=0)
+        except Exception:
+            pass
         # Status labels
         self.status.config(text=msg or ('處理中…' if busy else '就緒'))
         self.statusbar.config(text=msg or ('處理中…' if busy else 'Ready'))
@@ -308,6 +331,24 @@ class App(tk.Tk):
                     w.state(['!disabled']) if isinstance(w, ttk.Widget) else w.config(state='normal')
             except Exception:
                 pass
+
+    def _update_progress(self, pct: int):
+        """在主執行緒更新進度與狀態文字。"""
+        def _do():
+            if str(self.progress.cget('mode')) == 'determinate':
+                try:
+                    self.progress.config(value=pct)
+                except Exception:
+                    pass
+            # 只在 busy 狀態下顯示百分比
+            if self.is_busy:
+                base = '正在生成字幕中…'
+                self.status.config(text=f"{base} {pct}%")
+                self.statusbar.config(text=f"{base} {pct}%")
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
 
     def _openai_analyze(self, prompt):
         key = self.openai_key.get().strip()
