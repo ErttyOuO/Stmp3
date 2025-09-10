@@ -32,12 +32,8 @@ def _enable_windows_dpi_awareness():
         pass
 
 # ---------------- Local Whisper Availability -----------------
-try:
-    from faster_whisper import WhisperModel  # type: ignore
-    LOCAL_ENABLED = True
-except Exception:
-    WhisperModel = None  # type: ignore
-    LOCAL_ENABLED = False
+WhisperModel = None  # lazy import
+LOCAL_ENABLED = True  # will flip to False if import fails
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / 'data'
@@ -84,6 +80,46 @@ def save_config(cfg: dict):
 _LOCAL_MODEL = None
 _LOCAL_MODEL_LABEL = ''  # e.g. 'cuda/float16' or 'cpu/int8'
 _MODEL_LOCK = threading.Lock()
+FORCE_CPU = os.environ.get('STUDY_TOOL_FORCE_CPU') == '1'
+
+def _cuda_runtime_available():
+    """粗略檢查是否存在可用 CUDA runtime 與 cuDNN DLL。
+    只做快速檢測，避免在無效環境硬嘗試多次造成閃退。
+    """
+    if FORCE_CPU:
+        return False
+    if os.name != 'nt':
+        # 非 Windows 視為有機會（交給後續 try/except 真正判斷）
+        return True
+    path_entries = os.environ.get('PATH', '').split(os.pathsep)
+    keywords = ['cudnn', 'cublas', 'cudart']
+    found_any = False
+    for entry in path_entries:
+        try:
+            if not entry or not os.path.isdir(entry):
+                continue
+            files = [f.lower() for f in os.listdir(entry)]
+            if any(any(k in f for k in keywords) for f in files):
+                found_any = True
+                break
+        except Exception:
+            pass
+    return found_any
+
+# 嘗試延遲匯入 faster_whisper：若缺少 CUDA DLL，自動隱藏 GPU 讓其走純 CPU。
+def _ensure_import_faster_whisper():
+    global WhisperModel, LOCAL_ENABLED
+    if WhisperModel is not None:
+        return
+    # 若無 CUDA DLL，避免 GPU 掃描：隱藏 GPU
+    if not _cuda_runtime_available():
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
+    try:
+        from faster_whisper import WhisperModel as _WM  # type: ignore
+        WhisperModel = _WM
+    except Exception:
+        LOCAL_ENABLED = False
+        WhisperModel = None
 
 def _load_local_model():  # returns model, label
     global _LOCAL_MODEL, _LOCAL_MODEL_LABEL
@@ -91,30 +127,50 @@ def _load_local_model():  # returns model, label
         raise RuntimeError('本機模型不可用，請改用 OpenAI 模式')
     if _LOCAL_MODEL is not None:
         return _LOCAL_MODEL, _LOCAL_MODEL_LABEL
-    if WhisperModel is None:  # safety
-        raise RuntimeError('faster-whisper 未安裝')
-    attempts = [
-        ('cuda', 'float16'),
-        ('cuda', 'int8_float16'),
-        ('cuda', 'int8'),
-        ('cpu', 'int8'),
-        ('cpu', 'int8_float16'),
-        ('cpu', 'float32'),
-    ]
+    _ensure_import_faster_whisper()
+    if WhisperModel is None:
+        raise RuntimeError('faster-whisper 未安裝，或初始化失敗')
+    # 根據檢測結果決定嘗試列表
+    if _cuda_runtime_available():
+        attempts = [
+            ('cuda', 'float16'),
+            ('cuda', 'int8_float16'),
+            ('cuda', 'int8'),
+            ('cpu', 'int8'),
+            ('cpu', 'int8_float16'),
+            ('cpu', 'float32'),
+        ]
+    else:
+        attempts = [
+            ('cpu', 'int8'),
+            ('cpu', 'int8_float16'),
+            ('cpu', 'float32'),
+        ]
     errors = []
     with _MODEL_LOCK:
         if _LOCAL_MODEL is not None:  # double-check after acquiring lock
             return _LOCAL_MODEL, _LOCAL_MODEL_LABEL
+        disable_cuda = False
         for dev, ctype in attempts:
+            if disable_cuda and dev == 'cuda':
+                continue
             try:
                 m = WhisperModel('large-v3-turbo', device=dev, compute_type=ctype)
                 _LOCAL_MODEL = m
                 _LOCAL_MODEL_LABEL = f'{dev}/{ctype}'
                 break
             except Exception as e:
-                errors.append(f'{dev}/{ctype}: {e}')
+                msg = str(e)
+                errors.append(f'{dev}/{ctype}: {msg}')
+                lower = msg.lower()
+                if 'cudnn' in lower or 'cublas' in lower or 'could not locate' in lower or 'cannot load symbol' in lower:
+                    disable_cuda = True
+                    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
         if _LOCAL_MODEL is None:
-            raise RuntimeError('本機模型載入失敗:\n' + '\n'.join(errors))
+            hint = ''
+            if not _cuda_runtime_available() or FORCE_CPU:
+                hint = '\n提示：未偵測到完整 CUDA/cuDNN (或已強制 CPU)，如需 GPU 請安裝對應 CUDA Toolkit 與 cuDNN DLL，或設定 STMP3 環境。'
+            raise RuntimeError('本機模型載入失敗:\n' + '\n'.join(errors) + hint)
     return _LOCAL_MODEL, _LOCAL_MODEL_LABEL
 
 
