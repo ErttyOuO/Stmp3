@@ -10,7 +10,7 @@
 1. 安裝 Python 3.9+
 2. 安裝依賴
 ```powershell
-cd "c:\Users\luo\Desktop\學習工具\desktop\python"
+cd "c:\Users\[使用者名稱]\Desktop\學習工具\desktop\python"
 pip install -r requirements.txt
 ```
 
